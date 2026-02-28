@@ -34,18 +34,19 @@ dp = Dispatcher()
 
 # ========= PLANS (match your BMC tiers) =========
 # FREE: 10 pages/day
-# BASIC ($3): 30 pages/day
-# PRO   ($5): 200 pages/day + DOCX
-# PREMIUM ($10): 1000 pages/day + DOCX
+# BASIC ($3): 50 pages/day
+# STANDARD ($5): 120 pages/day
+# PREMIUM ($10): 300 pages/day + DOCX
+
 PLANS = {
     "FREE": 10,
-    "BASIC": 30,
-    "PRO": 200,
-    "PREMIUM": 1000,
+    "BASIC": 50,
+    "STANDARD": 120,
+    "PREMIUM": 300,
 }
 
-PAID_PLANS = {"BASIC", "PRO", "PREMIUM"}
-DOCX_PLANS = {"PRO", "PREMIUM"}
+PAID_PLANS = {"BASIC", "STANDARD", "PREMIUM"}
+DOCX_PLANS = {"PREMIUM"}
 
 DB_PATH = "data.db"
 
@@ -130,14 +131,16 @@ def add_usage_today(user_id: int, pages: int):
 # ========= TEXT HELPERS =========
 def upgrade_text() -> str:
     return (
-        "💎 Upgrade to unlock higher limits & features:\n\n"
-        "• BASIC ($3/month): 30 pages/day\n"
-        "• PRO ($5/month): 200 pages/day + TXT + DOCX\n"
-        "• PREMIUM ($10/month): 1000 pages/day + TXT + DOCX\n\n"
-        f"👉 Support here: {BMC_LINK}\n\n"
-        "After payment, send your Telegram ID with /id to the admin (or wait for auto-activation when enabled)."
+        "💎 Upgrade Plans\n\n"
+        "• BASIC ($3/month): 50 pages/day\n"
+        "• STANDARD ($5/month): 120 pages/day\n"
+        "• PREMIUM ($10/month): 300 pages/day + DOCX\n\n"
+        f"👉 Support here: {BMC_LINK}\n"
+        f"📣 Channel: {CHANNEL_LINK}\n\n"
+        "After payment:\n"
+        "1) Send /id to get your Telegram ID\n"
+        "2) Send that ID to the admin for manual activation."
     )
-
 
 def plan_text(user_id: int) -> str:
     p = get_user_plan(user_id)
@@ -206,19 +209,18 @@ async def setplan_cmd(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.answer("You are not authorized to use this command.")
 
-    parts = message.text.split()
-    if len(parts) != 3:
-        return await message.answer("Usage: /setplan TELEGRAM_ID FREE|BASIC|PRO|PREMIUM")
+parts = message.text.split()
+if len(parts) != 3:
+    return await message.answer("Usage: /setplan TELEGRAM_ID FREE|BASIC|STANDARD|PREMIUM")
 
-    try:
-        target_id = int(parts[1])
-    except ValueError:
-        return await message.answer("TELEGRAM_ID must be a number.")
+try:
+    target_id = int(parts[1])
+except ValueError:
+    return await message.answer("TELEGRAM_ID must be a number.")
 
-    plan_name = parts[2].upper().strip()
-    if plan_name not in PLANS:
-        return await message.answer("Invalid plan. Use: FREE | BASIC | PRO | PREMIUM")
-
+plan_name = parts[2].upper().strip()
+if plan_name not in PLANS:
+    return await message.answer("Invalid plan. Use: FREE | BASIC | STANDARD | PREMIUM")
     set_user_plan(target_id, plan_name)
     await message.answer(f"✅ Plan {plan_name} has been set for user {target_id}.")
 

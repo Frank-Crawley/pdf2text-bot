@@ -1,18 +1,25 @@
 import os
+import io
+import re
 import asyncio
 import sqlite3
-from datetime import date
+from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, BufferedInputFile
+from aiogram.filters import Command
 
 import fitz  # PyMuPDF
-from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import Message, BufferedInputFile
 from docx import Document
 
+
+# =========================
+# ENV
+# =========================
 load_dotenv()
 
-# ========= ENV =========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in environment variables.")
@@ -21,23 +28,17 @@ if not BOT_TOKEN:
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 BMC_LINK = os.getenv("BMC_LINK", "https://buymeacoffee.com/pdftotext").strip()
-
-# Optional: Telegram channel link
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/ConvertPDFtotext").strip()
 
-# Optional: Max upload size (bytes). Telegram bots can receive bigger files, but keep it safe on server.
-# Default: 20 MB
-MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(20 * 1024 * 1024)))
+DB_PATH = os.getenv("DB_PATH", "data.db").strip()
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-# ========= PLANS (match your BMC tiers) =========
+# =========================
+# PLANS (match your BMC tiers)
 # FREE: 10 pages/day
 # BASIC ($3): 50 pages/day
 # STANDARD ($5): 120 pages/day
 # PREMIUM ($10): 300 pages/day + DOCX
-
+# =========================
 PLANS = {
     "FREE": 10,
     "BASIC": 50,
@@ -48,24 +49,23 @@ PLANS = {
 PAID_PLANS = {"BASIC", "STANDARD", "PREMIUM"}
 DOCX_PLANS = {"PREMIUM"}
 
-DB_PATH = "data.db"
 
-
-# ========= DB =========
+# =========================
+# DB Helpers
+# =========================
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
 
-def init_db():
+def init_db() -> None:
     with db() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                plan TEXT NOT NULL DEFAULT 'FREE',
-                created_at TEXT NOT NULL
+                plan TEXT NOT NULL DEFAULT 'FREE'
             )
             """
         )
@@ -75,18 +75,21 @@ def init_db():
                 user_id INTEGER NOT NULL,
                 day TEXT NOT NULL,
                 pages_used INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, day)
+                PRIMARY KEY(user_id, day)
             )
             """
         )
 
 
-def ensure_user(user_id: int):
-    today = date.today().isoformat()
+def today_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def ensure_user(user_id: int) -> None:
     with db() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO users(user_id, plan, created_at) VALUES(?,?,?)",
-            (user_id, "FREE", today),
+            "INSERT OR IGNORE INTO users(user_id, plan) VALUES (?, 'FREE')",
+            (user_id,),
         )
 
 
@@ -94,10 +97,13 @@ def get_user_plan(user_id: int) -> str:
     ensure_user(user_id)
     with db() as conn:
         row = conn.execute("SELECT plan FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return row[0] if row else "FREE"
+    return (row[0] if row else "FREE").upper()
 
 
-def set_user_plan(user_id: int, plan: str):
+def set_user_plan(user_id: int, plan: str) -> None:
+    plan = plan.upper().strip()
+    if plan not in PLANS:
+        raise ValueError("Invalid plan")
     ensure_user(user_id)
     with db() as conn:
         conn.execute("UPDATE users SET plan=? WHERE user_id=?", (plan, user_id))
@@ -105,78 +111,120 @@ def set_user_plan(user_id: int, plan: str):
 
 def get_usage_today(user_id: int) -> int:
     ensure_user(user_id)
-    today = date.today().isoformat()
+    day = today_utc_str()
     with db() as conn:
         row = conn.execute(
             "SELECT pages_used FROM usage WHERE user_id=? AND day=?",
-            (user_id, today),
+            (user_id, day),
         ).fetchone()
     return int(row[0]) if row else 0
 
 
-def add_usage_today(user_id: int, pages: int):
+def add_usage_today(user_id: int, pages: int) -> None:
     ensure_user(user_id)
-    today = date.today().isoformat()
+    day = today_utc_str()
     with db() as conn:
         conn.execute(
             """
             INSERT INTO usage(user_id, day, pages_used)
-            VALUES(?,?,?)
+            VALUES (?, ?, ?)
             ON CONFLICT(user_id, day) DO UPDATE SET pages_used = pages_used + excluded.pages_used
             """,
-            (user_id, today, pages),
+            (user_id, day, int(pages)),
         )
 
 
-# ========= TEXT HELPERS =========
-def upgrade_text() -> str:
-    return (
-        "💎 Upgrade Plans\n\n"
-        "• BASIC ($3/month): 50 pages/day\n"
-        "• STANDARD ($5/month): 120 pages/day\n"
-        "• PREMIUM ($10/month): 300 pages/day + DOCX\n\n"
-        f"👉 Support here: {BMC_LINK}\n"
-        f"📣 Channel: {CHANNEL_LINK}\n\n"
-        "After payment:\n"
-        "1) Send /id to get your Telegram ID\n"
-        "2) Send that ID to the admin for manual activation."
-    )
-
-def plan_text(user_id: int) -> str:
-    p = get_user_plan(user_id)
-    used = get_usage_today(user_id)
-    limit = PLANS.get(p, PLANS["FREE"])
-    return (
-        f"📊 Your Plan: {p}\n"
-        f"Daily Limit: {limit} pages\n"
-        f"Used Today: {used} pages\n\n"
-        f"Use /upgrade to unlock higher limits."
-    )
-
-
+# =========================
+# Text Builders
+# =========================
 def help_text() -> str:
     return (
-        "📄 PDF to Text Bot — Commands\n\n"
-        "• /start — Introduction\n"
-        "• /plan — Show your current plan and daily usage\n"
-        "• /upgrade — Membership plans and payment link\n"
-        "• /id — Show your Telegram ID\n"
-        "• /help — Show this help\n\n"
-        "Send a PDF file to convert it to text.\n"
-        "PRO/PREMIUM users also receive a DOCX file."
+        "📄 PDF to Text Bot\n\n"
+        "Commands:\n"
+        "/start - Show welcome message\n"
+        "/help - Show this help\n"
+        "/id - Show your Telegram ID (for manual activation)\n"
+        "/plan - Show your current plan and daily usage\n"
+        "/upgrade - Show upgrade options\n\n"
+        "Just send a PDF file and I will convert it to text.\n"
     )
 
 
-# ========= COMMANDS =========
+def upgrade_text() -> str:
+    lines = [
+        "💎 Upgrade to unlock higher limits & features:",
+        "",
+        "• BASIC ($3/month): 50 pages/day",
+        "• STANDARD ($5/month): 120 pages/day",
+        "• PREMIUM ($10/month): 300 pages/day + DOCX",
+        "",
+        f"👉 Support here: {BMC_LINK}",
+        f"📣 Telegram channel: {CHANNEL_LINK}",
+        "",
+        "After payment, send your Telegram ID using /id to the admin for manual activation.",
+    ]
+    return "\n".join(lines)
+
+
+def plan_text(user_id: int) -> str:
+    plan = get_user_plan(user_id)
+    used = get_usage_today(user_id)
+    limit = PLANS.get(plan, PLANS["FREE"])
+    extra = ""
+    if plan in DOCX_PLANS:
+        extra = "\nDOCX export: ✅ Enabled"
+    else:
+        extra = "\nDOCX export: ❌ Premium only"
+    return (
+        f"📊 Your Plan: {plan}\n"
+        f"Daily Limit: {limit} pages\n"
+        f"Used Today: {used} pages\n"
+        f"Use /upgrade to unlock higher limits.\n"
+        f"{extra}"
+    )
+
+
+# =========================
+# PDF Conversion
+# =========================
+def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, int]:
+    """
+    Returns: (text, page_count)
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_count = doc.page_count
+    parts = []
+    for i in range(page_count):
+        page = doc.load_page(i)
+        parts.append(page.get_text("text"))
+    doc.close()
+    text = "\n".join(parts).strip()
+    return text, page_count
+
+
+def build_docx_bytes(text: str) -> bytes:
+    d = Document()
+    # Split into paragraphs
+    for para in re.split(r"\n\s*\n", text.strip() or ""):
+        d.add_paragraph(para.strip())
+    bio = io.BytesIO()
+    d.save(bio)
+    return bio.getvalue()
+
+
+# =========================
+# Bot Setup
+# =========================
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+
 @dp.message(Command("start"))
-async def start(message: Message):
-    ensure_user(message.from_user.id)
+async def start_cmd(message: Message):
     await message.answer(
-        "📄 PDF to Text Bot\n\n"
         "Send me a PDF file and I will convert it to text.\n"
         "Use /plan to see your current plan.\n"
-        "Use /upgrade to unlock higher limits.\n\n"
-        f"📢 Channel: {CHANNEL_LINK}"
+        "Use /upgrade to see upgrade options."
     )
 
 
@@ -185,22 +233,24 @@ async def help_cmd(message: Message):
     await message.answer(help_text())
 
 
+@dp.message(Command("upgrade"))
+async def upgrade_cmd(message: Message):
+    await message.answer(upgrade_text())
+
+
 @dp.message(Command("id"))
 async def id_cmd(message: Message):
+    user_id = message.from_user.id
     await message.answer(
-        f"🆔 Your Telegram ID: {message.from_user.id}\n\n"
+        f"🆔 Your Telegram ID: {user_id}\n\n"
         "Copy this ID and send it to the admin after payment for manual activation."
     )
 
 
 @dp.message(Command("plan"))
 async def plan_cmd(message: Message):
-    await message.answer(plan_text(message.from_user.id))
-
-
-@dp.message(Command("upgrade"))
-async def upgrade_cmd(message: Message):
-    await message.answer(upgrade_text())
+    user_id = message.from_user.id
+    await message.answer(plan_text(user_id))
 
 
 @dp.message(Command("setplan"))
@@ -209,23 +259,23 @@ async def setplan_cmd(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.answer("You are not authorized to use this command.")
 
-parts = message.text.split()
-if len(parts) != 3:
-    return await message.answer("Usage: /setplan TELEGRAM_ID FREE|BASIC|STANDARD|PREMIUM")
+    parts = message.text.split()
+    if len(parts) != 3:
+        return await message.answer("Usage: /setplan TELEGRAM_ID FREE|BASIC|STANDARD|PREMIUM")
 
-try:
-    target_id = int(parts[1])
-except ValueError:
-    return await message.answer("TELEGRAM_ID must be a number.")
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        return await message.answer("TELEGRAM_ID must be a number.")
 
-plan_name = parts[2].upper().strip()
-if plan_name not in PLANS:
-    return await message.answer("Invalid plan. Use: FREE | BASIC | STANDARD | PREMIUM")
+    plan_name = parts[2].upper().strip()
+    if plan_name not in PLANS:
+        return await message.answer("Invalid plan. Use: FREE | BASIC | STANDARD | PREMIUM")
+
     set_user_plan(target_id, plan_name)
     await message.answer(f"✅ Plan {plan_name} has been set for user {target_id}.")
 
 
-# ========= PDF HANDLER =========
 @dp.message(F.document)
 async def handle_document(message: Message):
     user_id = message.from_user.id
@@ -235,75 +285,65 @@ async def handle_document(message: Message):
     filename = (doc.file_name or "").lower()
 
     if not filename.endswith(".pdf"):
-        return await message.answer("Please send a PDF file.")
+        return await message.answer("Please send a PDF file (.pdf).")
 
-    if doc.file_size and doc.file_size > MAX_FILE_BYTES:
-        mb = MAX_FILE_BYTES / (1024 * 1024)
-        return await message.answer(
-            f"⚠️ File too large. Max allowed size is {mb:.0f} MB.\n\n" + upgrade_text()
-        )
+    # Download file
+    tg_file = await bot.get_file(doc.file_id)
+    file_bytes = await bot.download_file(tg_file.file_path)
+    pdf_bytes = file_bytes.read()
 
-    current_plan = get_user_plan(user_id)
-    daily_limit = PLANS.get(current_plan, PLANS["FREE"])
+    # Convert
+    try:
+        text, pages = extract_text_from_pdf(pdf_bytes)
+    except Exception:
+        return await message.answer("Failed to read this PDF. Please try another file.")
+
+    # Check limit
+    plan = get_user_plan(user_id)
+    limit = PLANS.get(plan, PLANS["FREE"])
     used = get_usage_today(user_id)
 
-    # Download file from Telegram
-    file_info = await bot.get_file(doc.file_id)
-    file_stream = await bot.download_file(file_info.file_path)
-    pdf_bytes = file_stream.read()
-
-    # Read PDF + pages
-    try:
-        pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception:
-        return await message.answer("⚠️ Failed to read this PDF. Please try another file.")
-
-    pages = len(pdf)
-
-    # Quota check
-    if used + pages > daily_limit:
-        pdf.close()
+    if used + pages > limit:
+        remaining = max(0, limit - used)
         return await message.answer(
-            f"⚠️ Daily limit exceeded.\n"
-            f"Used: {used}/{daily_limit} pages\n"
-            f"This file has {pages} pages.\n\n"
-            + upgrade_text()
+            f"⚠️ Daily limit reached.\n"
+            f"Plan: {plan}\n"
+            f"Remaining today: {remaining} pages\n\n"
+            f"Use /upgrade to unlock higher limits."
         )
 
-    # Extract text
-    text_parts = []
-    for page in pdf:
-        text_parts.append(page.get_text())
-    pdf.close()
-
-    text = "\n".join(text_parts).strip()
-    if not text:
-        return await message.answer(
-            "No text found in this PDF.\n"
-            "If your PDF is scanned images, OCR is not enabled yet on this bot."
-        )
-
-    # Save usage
+    # Count usage
     add_usage_today(user_id, pages)
 
+    # Build TXT
+    txt_bytes = (text or "").encode("utf-8", errors="replace")
+    txt_file = BufferedInputFile(txt_bytes, filename="converted.txt")
+
     # Send TXT
+    used_after = get_usage_today(user_id)
     await message.answer_document(
-        BufferedInputFile(text.encode("utf-8"), filename="converted.txt"),
-        caption=f"✅ Converted successfully. Pages used today: {get_usage_today(user_id)}/{daily_limit}"
+        txt_file,
+        caption=(
+            f"✅ Converted successfully.\n"
+            f"Pages used today: {used_after}/{limit}"
+        ),
     )
 
-    # Send DOCX for PRO/PREMIUM
-    if current_plan in DOCX_PLANS:
-        d = Document()
-        d.add_paragraph(text)
+    # Optional DOCX for PREMIUM only
+    if plan in DOCX_PLANS:
+        try:
+            docx_bytes = build_docx_bytes(text or "")
+            docx_file = BufferedInputFile(docx_bytes, filename="converted.docx")
+            await message.answer_document(docx_file, caption="📄 DOCX export (Premium).")
+        except Exception:
+            # Don't fail whole flow if DOCX fails
+            await message.answer("DOCX export failed, but TXT was created successfully.")
 
-        out_path = "converted.docx"
-        d.save(out_path)
-        with open(out_path, "rb") as f:
-            await message.answer_document(
-                BufferedInputFile(f.read(), filename="converted.docx"),
-                caption="✅ DOCX is available for PRO/PREMIUM."
-            )
+
+# Fallback
+@dp.message()
+async def fallback(message: Message):
+    await message.answer("Send a PDF file to convert it to text. Use /help for commands.")
 
 
 async def main():
